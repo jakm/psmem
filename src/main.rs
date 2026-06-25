@@ -5,6 +5,7 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 
+use clap::Parser;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
@@ -14,10 +15,19 @@ use regex::Regex;
 //  - take in account systemd cgroups for a more interesting tree view? (https://stackoverflow.com/questions/43892327/process-grouping-in-linux)
 // TODO add cli arg to distinguish column to sort by; maybe add filtering by program name
 
+/// A Rust program that analyzes memory usage of running processes by parsing /proc filesystem
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Show PIDs of ungrouped processes (those that have no other process with the same executable)
+    #[arg(short, long, default_value_t = false)]
+    pid: bool,
+}
+
 #[derive(Clone, Debug)]
 struct ProgramInfo {
     name: String,
-    no_processes: u64,
+    pids: Vec<i32>,
     mem_info: MemInfo,
 }
 
@@ -36,6 +46,8 @@ impl MemInfo {
 
 /// Main function that collects and displays memory usage statistics for all running processes
 fn main() {
+    let args = Args::parse();
+
     let mut stats: HashMap<String, ProgramInfo> = HashMap::new();
     let (sender, receiver) = channel();
 
@@ -54,13 +66,13 @@ fn main() {
             let rollup_path = Path::new(OsStr::new(&path));
             let info = count_mem_info_rollup(rollup_path).unwrap_or_else(|_| count_mem_info(&p));
 
-            let msg = (exe, info);
+            let msg = (exe, p.pid, info);
 
             s.send(msg).unwrap();
         });
 
     for msg in receiver {
-        let (exe, info) = msg;
+        let (exe, pid, info) = msg;
 
         if info.empty() {
             continue;
@@ -74,13 +86,13 @@ fn main() {
         stats
             .entry(name.clone())
             .and_modify(|e| {
-                e.no_processes += 1;
+                e.pids.push(pid);
                 e.mem_info.private += info.private;
                 e.mem_info.shared += info.shared;
             })
             .or_insert_with(|| ProgramInfo {
                 name,
-                no_processes: 1,
+                pids: vec![pid],
                 mem_info: info,
             });
     }
@@ -90,8 +102,17 @@ fn main() {
         return;
     }
 
-    println!("  Private   +  Shared (PSS)  =  Memory used\tProgram");
-    println!("");
+    let pid_header = if args.pid {
+        format!("{:>9}  ", "PID")
+    } else {
+        String::new()
+    };
+    let header = format!(
+        "{:>10}   +   {:>10}  =   Memory used\t{}Program",
+        "Private", "Shared (PSS)", pid_header
+    );
+
+    println!("{}\n", header);
 
     let ordered_stats = stats
         .values()
@@ -101,10 +122,17 @@ fn main() {
     let mut total = MemInfo::default();
 
     for p in ordered_stats {
-        let title = if p.no_processes > 1 {
-            format!("{} ({})", p.name, p.no_processes)
+        let name = if p.pids.len() > 1 {
+            format!("{} ({})", p.name, p.pids.len())
         } else {
             p.name.clone()
+        };
+        let title = if !args.pid {
+            name
+        } else if p.pids.len() > 1 {
+            format!("{}{}", " ".repeat(pid_header.len()), name)
+        } else {
+            format!("{:>9}  {}", p.pids[0], name)
         };
         print_mem_info(&title, &p.mem_info);
 
@@ -166,7 +194,7 @@ fn print_mem_info(title: &str, mem_info: &MemInfo) {
     let (total, total_unit) = humanize_bytes(mem_info.private + mem_info.shared);
 
     println!(
-        "{:6.1} {}  +   {:6.1} {}   =   {:6.1} {}\t{}",
+        "{:6.1} {}   +   {:8.1} {}  =  {:8.1} {}\t{}",
         private, private_unit, shared, shared_unit, total, total_unit, title,
     );
 }
@@ -175,7 +203,7 @@ const KIBIBYTE: u64 = 1024;
 const MEBIBYTE: u64 = 1024 * 1024;
 const GIBIBYTE: u64 = 1024 * 1024 * 1024;
 
-const UNIT_BYTE: &str = "B  ";
+const UNIT_BYTE: &str = "  B";
 const UNIT_KIBIBYTE: &str = "KiB";
 const UNIT_MEBIBYTE: &str = "MiB";
 const UNIT_GIBIBYTE: &str = "GiB";
@@ -243,9 +271,9 @@ fn count_mem_info(p: &procfs::process::Process) -> MemInfo {
     let mut info = MemInfo::default();
     if let Ok(maps) = p.smaps() {
         maps.iter()
-            .map(|(_, mmd)| {
-                let private = sum_values(&mmd.map, &PRIVATE_FIELDS);
-                let pss = mmd.map.get("Pss").unwrap_or(&0).clone();
+            .map(|mm| {
+                let private = sum_values(&mm.extension.map, &PRIVATE_FIELDS);
+                let pss = mm.extension.map.get("Pss").unwrap_or(&0).clone();
                 let shared = pss - private;
                 (private, shared)
             })
@@ -260,12 +288,6 @@ fn count_mem_info(p: &procfs::process::Process) -> MemInfo {
 }
 
 /// Sums values from a HashMap for the specified keys
-fn sum_values(map: &HashMap<String, u64>, keys: &Vec<String>) -> u64 {
-    let mut sum = 0;
-    for key in keys {
-        if let Some(v) = map.get(key) {
-            sum += v;
-        }
-    }
-    sum
+fn sum_values(map: &HashMap<String, u64>, keys: &[String]) -> u64 {
+    keys.iter().filter_map(|k| map.get(k)).sum()
 }
